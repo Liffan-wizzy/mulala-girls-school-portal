@@ -1,0 +1,1 @@
+ALTER TABLE parent_messages ADD COLUMN sender_role TEXT NOT NULL DEFAULT 'PARENT' CHECK (sender_role IN ('PARENT', 'SECRETARY'));

@@ -1,0 +1,27 @@
+{
+    "name": "mulala-girls-school-portal",
+    "private": true,
+    "version": "1.0.0",
+    "type": "module",
+    "scripts": {
+        "dev": "vite",
+        "build": "tsc -b && vite build",
+        "preview": "vite preview",
+        "cf:dev": "wrangler pages dev dist",
+        "cf:deploy": "npm run build && wrangler pages deploy dist"
+    },
+    "dependencies": {
+        "@vitejs/plugin-react": "latest",
+        "react": "latest",
+        "react-dom": "latest",
+        "typescript": "latest",
+        "vite": "latest"
+    },
+    "devDependencies": {
+        "@cloudflare/workers-types": "latest",
+        "@types/react": "^19.3.0",
+        "@types/react-dom": "^19.3.0",
+        "vite-plugin-pwa": "latest",
+        "wrangler": "latest"
+    }
+}

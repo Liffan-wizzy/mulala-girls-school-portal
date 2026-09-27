@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Mulala Girls High School">
+  <rect width="512" height="512" rx="112" fill="#163c35"/>
+  <path d="M256 62 400 116v111c0 102-58 176-144 223-86-47-144-121-144-223V116L256 62Z" fill="#f6f8f6"/>
+  <path d="M256 91 373 135v92c0 82-43 144-117 188-74-44-117-106-117-188v-92l117-44Z" fill="#1d5146"/>
+  <path d="M175 186h162v22H175zm14 35h134v19H189z" fill="#dcebe2"/>
+  <path d="M208 164h96v91h-96z" fill="#f6f8f6"/>
+  <path d="M224 181h64v57h-64z" fill="#dcebe2"/>
+  <path d="M256 181v57" stroke="#1d5146" stroke-width="6"/>
+  <path d="m181 283 75 28 75-28v75l-75 29-75-29z" fill="#f0cf8c"/>
+  <text x="256" y="356" text-anchor="middle" font-family="Arial,sans-serif" font-size="67" font-weight="700" fill="#163c35">M</text>
+</svg>
