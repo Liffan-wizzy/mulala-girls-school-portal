@@ -15,8 +15,10 @@ const json = (body: unknown, status = 200) =>
     });
 
 const badRequest = (message: string) => json({ error: message }, 400);
-function encodeUrlSafe(bytes: Uint8Array): strng {
-    return btoa(String.fromCharCode(...bytes))
+function encodeUrlSafe(bytes: Uint8Array): string {
+    return btoa(
+        Array.from(bytes, (byte) => String.fromCharCode(byte)).join('')
+    )
         .replace(/\+/g, '-')
         .replace(/\//g, '_')
         .replace(/=+$/, '');
