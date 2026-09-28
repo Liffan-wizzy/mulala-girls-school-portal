@@ -1,53 +1,88 @@
 /// <reference types="@cloudflare/workers-types" />
-
 interface Env {
     DB: D1Database;
-    ACCESS_TEAM_DOMAIN?: string;
-    ACCESS_AUD?: string;
-    ACCESS_ALLOWED_EMAILS?: string;
 }
 
 type Context = { request: Request; env: Env };
-type JwtClaims = { aud?: string | string[]; exp?: number; nbf?: number; iss?: string; email?: string };
-const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' } });
+
+const json = (body: unknown, status = 200) =>
+    new Response(JSON.stringify(body), {
+        status,
+        headers: {
+            'Content-Type': 'application/json; charset=utf-8',
+            'Cache-Control': 'no-store',
+        },
+    });
+
 const badRequest = (message: string) => json({ error: message }, 400);
-const decodePart = (part: string) => Uint8Array.from(atob(part.replace(/-/g, '+').replace(/_/g, '/').padEnd(Math.ceil(part.length / 4) * 4, '=')), (char) => char.charCodeAt(0));
-const encodeUrlSafe = (bytes: Uint8Array) => btoa(Array.from(bytes, (byte) => String.fromCharCode(byte)).join('')).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-async function hashToken(token: string): Promise<string> {
-    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(token));
-    return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
+
+async function hashPassword(password: string, salt: Uint8Array): Promise<string> {
+    const key = await crypto.subtle.importKey(
+        'raw',
+        new TextEncoder().encode(password),
+        'PBKDF2',
+        false,
+        ['deriveBits']
+    );
+
+    const bits = await crypto.subtle.deriveBits(
+        {
+            name: 'PBKDF2',
+            salt,
+            iterations: 100000,
+            hash: 'SHA-256',
+        },
+        key,
+        256
+    );
+
+    return Array.from(new Uint8Array(bits))
+        .map((byte) => byte.toString(16).padStart(2, '0'))
+        .join('');
 }
 
-async function getVerifiedEmail(request: Request, env: Env): Promise<string | null> {
-    if (!env.ACCESS_TEAM_DOMAIN || !env.ACCESS_AUD) return null;
-    const token = request.headers.get('Cf-Access-Jwt-Assertion');
-    if (!token) return null;
-    try {
-        const [encodedHeader, encodedClaims, encodedSignature] = token.split('.');
-        if (!encodedHeader || !encodedClaims || !encodedSignature) return null;
-        const header = JSON.parse(new TextDecoder().decode(decodePart(encodedHeader))) as { alg?: string; kid?: string };
-        const claims = JSON.parse(new TextDecoder().decode(decodePart(encodedClaims))) as JwtClaims;
-        if (header.alg !== 'RS256' || !header.kid) return null;
-        const teamDomain = env.ACCESS_TEAM_DOMAIN.replace(/^https?:\/\//, '').replace(/\/$/, '');
-        if (claims.iss !== `https://${teamDomain}` || !claims.exp || claims.exp <= Date.now() / 1000 || (claims.nbf && claims.nbf > Date.now() / 1000)) return null;
-        const audiences = Array.isArray(claims.aud) ? claims.aud : [claims.aud];
-        if (!audiences.includes(env.ACCESS_AUD)) return null;
-        if (env.ACCESS_ALLOWED_EMAILS) {
-            const allowed = env.ACCESS_ALLOWED_EMAILS.split(',').map((email) => email.trim().toLowerCase()).filter(Boolean);
-            if (!claims.email || !allowed.includes(claims.email.toLowerCase())) return null;
-        }
-        const certResponse = await fetch(`https://${teamDomain}/cdn-cgi/access/certs`, { cf: { cacheTtl: 300, cacheEverything: true } } as RequestInit);
-        if (!certResponse.ok) return null;
-        const certs = await certResponse.json() as { keys?: JsonWebKey[] };
-        const jwk = certs.keys?.find((key) => (key as JsonWebKey & { kid?: string }).kid === header.kid);
-        if (!jwk) return null;
-        const publicKey = await crypto.subtle.importKey('jwk', jwk, { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['verify']);
-        const valid = await crypto.subtle.verify('RSASSA-PKCS1-v1_5', publicKey, decodePart(encodedSignature), new TextEncoder().encode(`${encodedHeader}.${encodedClaims}`));
-        return valid && claims.email ? claims.email.trim().toLowerCase() : null;
-    } catch {
-        return null;
-    }
+function randomToken(): string {
+    const bytes = crypto.getRandomValues(new Uint8Array(32));
+    return btoa(String.fromCharCode(...bytes))
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+        .replace(/=+$/, '');
 }
+
+async function hashToken(token: string): Promise<string> {
+    const digest = await crypto.subtle.digest(
+        'SHA-256',
+        new TextEncoder().encode(token)
+    );
+
+    return Array.from(new Uint8Array(digest))
+        .map((byte) => byte.toString(16).padStart(2, '0'))
+        .join('');
+}
+
+async function getSessionEmail(
+    request: Request,
+    env: Env
+): Promise<string | null> {
+    const cookie = request.headers.get('Cookie') || '';
+    const match = cookie.match(/school_session=([^;]+)/);
+
+    if (!match) return null;
+
+    const sessionHash = await hashToken(match[1]);
+
+    const session = await env.DB.prepare(
+        `SELECT account_email AS email
+         FROM auth_sessions
+         WHERE id = ?
+         AND datetime(expires_at) > datetime('now')`
+    )
+        .bind(sessionHash)
+        .first<{ email: string }>();
+
+    return session?.email?.toLowerCase() || null;
+}
+
 
 function validForm(form: unknown): form is string { return typeof form === 'string' && ['Form 1', 'Form 2', 'Form 3', 'Form 4'].includes(form); }
 function validText(value: unknown, max = 160): value is string { return typeof value === 'string' && value.trim().length > 0 && value.length <= max; }
@@ -95,8 +130,8 @@ export async function onRequest({ request, env }: Context): Promise<Response> {
             return json({ error: 'The enquiry could not be saved. Please try again later.' }, 500);
         }
     }
-    const email = await getVerifiedEmail(request, env);
-    if (!email) return json({ error: 'Access denied. Sign in through the school Cloudflare Access application.' }, 401);
+   const email = await getSessionEmail(request, env);
+    if (!email) return json({ error: 'Access denied. Please sign in.' }, 401);
     const account = await env.DB.prepare('SELECT email, role, subject, form, stream, active FROM accounts WHERE email = ? AND active = 1').bind(email).first<{ email: string; role: 'SECRETARY' | 'TEACHER' | 'PARENT'; subject: string | null; form: string; stream: string; active: number }>();
     if (!account) return json({ error: 'This sign-in is not linked to an active school account. Contact the secretary.' }, 403);
 
