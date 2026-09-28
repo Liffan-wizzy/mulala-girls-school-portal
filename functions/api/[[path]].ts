@@ -15,34 +15,14 @@ const json = (body: unknown, status = 200) =>
     });
 
 const badRequest = (message: string) => json({ error: message }, 400);
-
-async function hashPassword(password: string, salt: Uint8Array): Promise<string> {
-    const key = await crypto.subtle.importKey(
-        'raw',
-        new TextEncoder().encode(password),
-        'PBKDF2',
-        false,
-        ['deriveBits']
-    );
-
-    const bits = await crypto.subtle.deriveBits(
-        {
-            name: 'PBKDF2',
-            salt,
-            iterations: 100000,
-            hash: 'SHA-256',
-        },
-        key,
-        256
-    );
-
-    return Array.from(new Uint8Array(bits))
-        .map((byte) => byte.toString(16).padStart(2, '0'))
-        .join('');
-}
-
 function randomToken(): string {
     const bytes = crypto.getRandomValues(new Uint8Array(32));
+    return btoa(String.fromCharCode(...bytes))
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+        .replace(/=+$/, '');
+}
+function encodeUrlSafe(bytes: Uint8Array): string {
     return btoa(String.fromCharCode(...bytes))
         .replace(/\+/g, '-')
         .replace(/\//g, '_')
