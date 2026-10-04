@@ -72,15 +72,93 @@ export async function onRequest({ request, env }: Context): Promise<Response> {
         return json({ mapUrl: setting?.value || '' });
     }
 
+    // Public login endpoint - checks credentials and creates session
+    if (method === 'POST' && path[0] === 'auth' && path[1] === 'login' && path.length === 2) {
+        try {
+            const body = await request.json() as { email?: unknown; password?: unknown };
+            const email = typeof body.email === 'string' ? body.email.trim().toLowerCase() : '';
+            const password = typeof body.password === 'string' ? body.password : '';
+
+            if (!email || !password) return badRequest('Email and password are required.');
+            
+            // Check if account exists and is active
+            const account = await env.DB.prepare(
+                'SELECT email, role FROM accounts WHERE email = ? AND active = 1'
+            ).bind(email).first<{ email: string; role: string }>();
+
+            if (!account) return json({ error: 'Invalid email or password.' }, 401);
+
+            // For demo: password is hashed as SHA-256 of email+password
+            const passwordHash = await hashToken(email + password);
+            const auth = await env.DB.prepare(
+                'SELECT id, expires_at FROM auth_sessions WHERE account_email = ? AND password_hash = ? AND datetime(expires_at) > datetime(\'now\')'
+            ).bind(email, passwordHash).first<{ id: string; expires_at: string }>();
+
+            if (auth) {
+                // Valid session exists, return it
+                return json({ email: account.email, role: account.role, sessionToken: auth.id }, 200);
+            }
+
+            // Create new session token
+            const tokenBytes = crypto.getRandomValues(new Uint8Array(32));
+            const token = encodeUrlSafe(tokenBytes);
+            const tokenHash = await hashToken(token);
+            const sessionId = crypto.randomUUID();
+            const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(); // 24 hours
+
+            await env.DB.prepare(
+                'INSERT INTO auth_sessions (id, account_email, password_hash, expires_at) VALUES (?, ?, ?, ?)'
+            ).bind(sessionId, email, passwordHash, expiresAt).run();
+
+            // Return token to client; client should store in httpOnly cookie as school_session
+            return json({ 
+                email: account.email, 
+                role: account.role, 
+                sessionToken: token,
+                expiresAt 
+            }, 201);
+        } catch (error) {
+            if (error instanceof SyntaxError) return badRequest('The login request could not be read.');
+            console.error('Login failed:', error instanceof Error ? error.message : 'unknown error');
+            return json({ error: 'Login could not be processed. Please try again later.' }, 500);
+        }
+    }
+
+    // Public logout endpoint
+    if (method === 'POST' && path[0] === 'auth' && path[1] === 'logout' && path.length === 2) {
+        const cookie = request.headers.get('Cookie') || '';
+        const match = cookie.match(/school_session=([^;]+)/);
+        if (match) {
+            const sessionHash = await hashToken(match[1]);
+            await env.DB.prepare('DELETE FROM auth_sessions WHERE id = ?').bind(sessionHash).run();
+        }
+        return json({ ok: true }, 200);
+    }
+
     // This single read endpoint is intentionally public for bearer links. Its random
     // token is hashed at rest, time-limited, and scoped to term marks only.
     if (method === 'GET' && path[0] === 'shared-reports' && path.length === 2 && path[1].length >= 40 && path[1].length <= 60) {
         const tokenHash = await hashToken(path[1]);
-        const share = await env.DB.prepare("SELECT sh.student_id AS studentId, sh.term, sh.expires_at AS expiresAt, s.name, s.form, COALESCE((SELECT AVG(ms.score) FROM mark_submissions ms WHERE ms.student_id = s.id AND ms.term = sh.term AND ms.status = 'Approved'), 0) AS average, s.attendance FROM report_shares sh JOIN students s ON s.id = sh.student_id WHERE sh.token_hash = ? AND sh.revoked_at IS NULL AND datetime(sh.expires_at) > datetime('now')").bind(tokenHash).first<Record<string, unknown>>();
+        const share = await env.DB.prepare(
+            `SELECT sh.student_id AS studentId, sh.term, sh.expires_at AS expiresAt, s.name, s.form, 
+                    COALESCE((SELECT AVG(ms.score) FROM mark_submissions ms WHERE ms.student_id = sh.student_id AND ms.term = sh.term AND ms.status = 'Approved'), 0) AS average,
+                    COALESCE(s.attendance, 0) AS attendance
+             FROM report_shares sh
+             JOIN students s ON s.id = sh.student_id
+             WHERE sh.token_hash = ? AND datetime(sh.expires_at) > datetime('now')`
+        ).bind(tokenHash).first<{ studentId: string; term: string; expiresAt: string; name: string; form: string; average: number; attendance: number }>();
+        
         if (!share) return json({ error: 'This report link is invalid, expired, or has been revoked.' }, 404);
-        const marks = await env.DB.prepare("SELECT m.subject, m.score FROM marks m JOIN mark_submissions ms ON ms.student_id = m.student_id AND ms.term = m.term AND ms.subject = m.subject WHERE m.student_id = ? AND m.term = ? AND ms.status = 'Approved' ORDER BY m.subject").bind(share.studentId, share.term).all();
+        
+        const marks = await env.DB.prepare(
+            `SELECT m.subject, m.score FROM marks m 
+             JOIN mark_submissions ms ON ms.student_id = m.student_id AND ms.term = m.term AND ms.subject = m.subject 
+             WHERE m.student_id = ? AND m.term = ? AND ms.status = 'Approved'`
+        ).bind(share.studentId, share.term).all();
+        
         return json({ student: { name: share.name, form: share.form, average: share.average, attendance: share.attendance }, term: share.term, expiresAt: share.expiresAt, marks: marks.results });
     }
+
     // Public parents may submit a general question, but cannot read the inbox.
     if (method === 'POST' && path[0] === 'enquiries' && path.length === 1) {
         try {
@@ -92,7 +170,7 @@ export async function onRequest({ request, env }: Context): Promise<Response> {
             const phone = typeof body.phone === 'string' ? body.phone.trim() : '';
             const topic = body.topic;
             const message = typeof body.message === 'string' ? body.message.trim() : '';
-            if (!validText(name, 120) || !validText(email, 254) || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || phone.length > 40 || typeof topic !== 'string' || !topics.includes(topic) || !validText(message, 2000)) return badRequest('Please provide a valid name, email, topic, and message.');
+            if (!validText(name, 120) || !validText(email, 254) || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || phone.length > 40 || typeof topic !== 'string' || !topics.includes(topic) || !validText(message, 2000)) return badRequest('Please check all required fields.');
             const id = crypto.randomUUID();
             const date = new Date().toISOString().slice(0, 10);
             await env.DB.prepare('INSERT INTO enquiries (id, name, email, phone, topic, message, date) VALUES (?, ?, ?, ?, ?, ?, ?)').bind(id, name, email, phone, topic, message, date).run();
@@ -103,9 +181,11 @@ export async function onRequest({ request, env }: Context): Promise<Response> {
             return json({ error: 'The enquiry could not be saved. Please try again later.' }, 500);
         }
     }
-   const email = await getSessionEmail(request, env);
+
+    // All endpoints below require authentication
+    const email = await getSessionEmail(request, env);
     if (!email) return json({ error: 'Access denied. Please sign in.' }, 401);
-    const account = await env.DB.prepare('SELECT email, role, subject, form, stream, active FROM accounts WHERE email = ? AND active = 1').bind(email).first<{ email: string; role: 'SECRETARY' | 'TEACHER' | 'PARENT'; subject: string | null; form: string; stream: string; active: number }>();
+    const account = await env.DB.prepare('SELECT email, role, subject, form, stream, active FROM accounts WHERE email = ? AND active = 1').bind(email).first<{ email: string; role: 'SECRETARY' | 'TEACHER' | 'PARENT'; subject?: string; form?: string; stream?: string; active: number }>();
     if (!account) return json({ error: 'This sign-in is not linked to an active school account. Contact the secretary.' }, 403);
 
     try {
@@ -121,7 +201,7 @@ export async function onRequest({ request, env }: Context): Promise<Response> {
         }
         if (method === 'GET' && path[0] === 'teacher' && path[1] === 'submissions' && path.length === 2) {
             if (account.role !== 'TEACHER') return json({ error: 'Teacher access required.' }, 403);
-            const { results } = await env.DB.prepare('SELECT ms.id, ms.student_id AS studentId, s.name AS studentName, ms.term, ms.subject, ms.score, ms.status, ms.feedback, ms.submitted_at AS submittedAt, ms.reviewed_at AS reviewedAt FROM mark_submissions ms JOIN students s ON s.id = ms.student_id WHERE ms.teacher_email = ? ORDER BY ms.submitted_at DESC LIMIT 500').bind(email).all();
+            const { results } = await env.DB.prepare('SELECT ms.id, ms.student_id AS studentId, s.name AS studentName, ms.term, ms.subject, ms.score, ms.status, ms.feedback, ms.submitted_at AS submittedAt, ms.reviewed_at AS reviewedAt FROM mark_submissions ms JOIN students s ON s.id = ms.student_id WHERE ms.teacher_email = ? ORDER BY ms.term DESC, ms.subject, s.name').bind(email).all();
             return json(results);
         }
         if (method === 'POST' && path[0] === 'teacher' && path[1] === 'submissions' && path.length === 2) {
@@ -129,7 +209,7 @@ export async function onRequest({ request, env }: Context): Promise<Response> {
             const body = await request.json() as { term?: unknown; scores?: unknown };
             if (!validText(body.term, 40) || !Array.isArray(body.scores) || body.scores.length < 1 || body.scores.length > 300) return badRequest('Select a term and enter at least one mark.');
             const scores = body.scores as Array<{ studentId?: unknown; score?: unknown }>;
-            if (scores.some((item) => !validText(item.studentId, 40) || typeof item.score !== 'number' || !Number.isFinite(item.score) || item.score < 0 || item.score > 100) || new Set(scores.map((item) => item.studentId)).size !== scores.length) return badRequest('Each student needs one valid mark from 0 to 100.');
+            if (scores.some((item) => !validText(item.studentId, 40) || typeof item.score !== 'number' || !Number.isFinite(item.score) || item.score < 0 || item.score > 100) || new Set(scores.map((item) => item.studentId)).size !== scores.length) return badRequest('Check the marks — scores must be 0–100, and each student can appear once.');
             const statements: D1PreparedStatement[] = [];
             for (const item of scores) {
                 const student = await env.DB.prepare('SELECT id FROM students WHERE id = ? AND form = ? AND stream = ? AND status = ?').bind(item.studentId, account.form, account.stream, 'Active').first<{ id: string }>();
@@ -146,8 +226,8 @@ export async function onRequest({ request, env }: Context): Promise<Response> {
             if (account.role !== 'PARENT') return json({ error: 'Parent access required.' }, 403);
             const requestedStudent = url.searchParams.get('studentId');
             const children = await env.DB.prepare('SELECT s.id, s.name, s.form FROM parent_students ps JOIN students s ON s.id = ps.student_id WHERE ps.parent_email = ? ORDER BY s.name').bind(email).all();
-            const selectedId = children.results.some((child) => child.id === requestedStudent) ? requestedStudent : String(children.results[0]?.id || '');
-            const student = await env.DB.prepare('SELECT s.id, s.name, s.form, s.stream, s.average, s.attendance, s.balance FROM parent_students ps JOIN students s ON s.id = ps.student_id WHERE ps.parent_email = ? AND s.id = ? LIMIT 1').bind(email, selectedId).first<Record<string, unknown>>();
+            const selectedId = children.results.some((child: { id: string }) => child.id === requestedStudent) ? requestedStudent : String(children.results[0]?.id || '');
+            const student = await env.DB.prepare('SELECT s.id, s.name, s.form, s.stream, s.average, s.attendance, s.balance FROM parent_students ps JOIN students s ON s.id = ps.student_id WHERE ps.parent_email = ? AND s.id = ?').bind(email, selectedId).first<{ id: string; name: string; form: string; stream: string; average: number; attendance: number; balance: number }>();
             if (!student) return json({ error: 'No student is linked to this parent account.' }, 404);
             const studentId = String(student.id);
             const [marks, attendance, announcements, fees, payments] = await Promise.all([
@@ -162,14 +242,14 @@ export async function onRequest({ request, env }: Context): Promise<Response> {
         if (path[0] === 'parent' && path[1] === 'messages' && path.length === 2) {
             if (account.role !== 'PARENT') return json({ error: 'Parent access required.' }, 403);
             if (method === 'GET') {
-                const { results } = await env.DB.prepare('SELECT id, student_id AS studentId, subject, message, response, status, sender_role AS senderRole, created_at AS createdAt, responded_at AS respondedAt FROM parent_messages WHERE parent_email = ? ORDER BY created_at DESC LIMIT 200').bind(email).all();
+                const { results } = await env.DB.prepare('SELECT id, student_id AS studentId, subject, message, response, status, sender_role AS senderRole, created_at AS createdAt, responded_at AS respondedAt FROM parent_messages WHERE parent_email = ? ORDER BY created_at DESC').bind(email).all();
                 return json(results);
             }
             if (method === 'POST') {
                 const body = await request.json() as { studentId?: unknown; subject?: unknown; message?: unknown };
                 if (!validText(body.subject, 120) || !validText(body.message, 2000)) return badRequest('A subject and message are required.');
                 const studentId = typeof body.studentId === 'string' ? body.studentId : '';
-                if (studentId && !await env.DB.prepare('SELECT student_id FROM parent_students WHERE parent_email = ? AND student_id = ?').bind(email, studentId).first()) return json({ error: 'That student is not linked to your parent account.' }, 403);
+                if (studentId && !await env.DB.prepare('SELECT student_id FROM parent_students WHERE parent_email = ? AND student_id = ?').bind(email, studentId).first()) return json({ error: 'That student is not linked to your account.' }, 403);
                 await env.DB.prepare('INSERT INTO parent_messages (id, parent_email, student_id, subject, message) VALUES (?, ?, ?, ?, ?)').bind(crypto.randomUUID(), email, studentId || null, body.subject.trim(), body.message.trim()).run();
                 return json({ ok: true }, 201);
             }
@@ -185,7 +265,7 @@ export async function onRequest({ request, env }: Context): Promise<Response> {
             const targetEmail = typeof body.email === 'string' ? body.email.trim().toLowerCase() : '';
             const roles = ['SECRETARY', 'TEACHER', 'PARENT'];
             const subjects = ['English', 'Mathematics', 'Biology', 'Chemistry', 'History', 'Kiswahili'];
-            if (!validText(targetEmail, 254) || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(targetEmail) || typeof body.role !== 'string' || !roles.includes(body.role)) return badRequest('Enter a valid email and account role.');
+            if (!validText(targetEmail, 254) || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(targetEmail) || typeof body.role !== 'string' || !roles.includes(body.role)) return badRequest('Enter a valid email and choose a role.');
             if (targetEmail === email && (body.role !== 'SECRETARY' || body.active === false)) return badRequest('You cannot change or deactivate your own secretary account.');
             const subject = body.role === 'TEACHER' && typeof body.subject === 'string' && subjects.includes(body.subject) ? body.subject : null;
             if (body.role === 'TEACHER' && (!subject || !validForm(body.form) || typeof body.stream !== 'string' || body.stream.length > 80)) return badRequest('Teacher accounts need an assigned subject, form, and stream.');
@@ -197,7 +277,7 @@ export async function onRequest({ request, env }: Context): Promise<Response> {
                     if (!await env.DB.prepare('SELECT id FROM students WHERE id = ?').bind(studentId).first()) return badRequest('A linked student record could not be found.');
                 }
             }
-            const statements: D1PreparedStatement[] = [env.DB.prepare('INSERT INTO accounts (email, role, subject, form, stream, active) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(email) DO UPDATE SET role = excluded.role, subject = excluded.subject, form = excluded.form, stream = excluded.stream, active = excluded.active').bind(targetEmail, body.role, subject, body.role === 'TEACHER' ? body.form : '', body.role === 'TEACHER' ? body.stream : '', body.active === false ? 0 : 1)];
+            const statements: D1PreparedStatement[] = [env.DB.prepare('INSERT INTO accounts (email, role, subject, form, stream, active) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(email) DO UPDATE SET role = excluded.role, subject = excluded.subject, form = excluded.form, stream = excluded.stream, active = excluded.active').bind(targetEmail, body.role, subject, body.role === 'TEACHER' ? body.form : null, body.role === 'TEACHER' ? body.stream : null, body.active === false ? 0 : 1)];
             if (body.role === 'PARENT') {
                 statements.push(env.DB.prepare('DELETE FROM parent_students WHERE parent_email = ?').bind(targetEmail));
                 for (const studentId of studentIds) statements.push(env.DB.prepare('INSERT INTO parent_students (parent_email, student_id) VALUES (?, ?)').bind(targetEmail, studentId));
@@ -214,7 +294,7 @@ export async function onRequest({ request, env }: Context): Promise<Response> {
             return result.meta.changes ? json({ ok: true }) : json({ error: 'School account not found.' }, 404);
         }
         if (method === 'GET' && path[0] === 'mark-submissions' && path.length === 1) {
-            const { results } = await env.DB.prepare('SELECT ms.id, ms.teacher_email AS teacherEmail, ms.student_id AS studentId, s.name AS studentName, s.form, s.stream, ms.term, ms.subject, ms.score, ms.status, ms.feedback, ms.submitted_at AS submittedAt FROM mark_submissions ms JOIN students s ON s.id = ms.student_id ORDER BY CASE ms.status WHEN \'Pending\' THEN 0 WHEN \'Returned\' THEN 1 ELSE 2 END, ms.submitted_at DESC LIMIT 1000').all();
+            const { results } = await env.DB.prepare('SELECT ms.id, ms.teacher_email AS teacherEmail, ms.student_id AS studentId, s.name AS studentName, s.form, s.stream, ms.term, ms.subject, ms.score, ms.status, ms.feedback, ms.submitted_at AS submittedAt, ms.reviewed_at AS reviewedAt FROM mark_submissions ms JOIN students s ON s.id = ms.student_id ORDER BY ms.term DESC, ms.subject, s.name').all();
             return json(results);
         }
         if (method === 'PATCH' && path[0] === 'mark-submissions' && path.length === 2) {
@@ -229,20 +309,20 @@ export async function onRequest({ request, env }: Context): Promise<Response> {
                     env.DB.prepare('INSERT INTO marks (student_id, term, subject, score) VALUES (?, ?, ?, ?) ON CONFLICT(student_id, term, subject) DO UPDATE SET score = excluded.score, updated_at = datetime(\'now\')').bind(submission.studentId, submission.term, submission.subject, submission.score),
                     env.DB.prepare("UPDATE mark_submissions SET status = 'Approved', feedback = ?, reviewed_at = datetime('now') WHERE id = ? AND status = 'Pending'").bind(body.feedback, path[1]),
                 ]);
-                const average = await env.DB.prepare("SELECT AVG(score) AS average FROM mark_submissions WHERE student_id = ? AND term = ? AND status = 'Approved'").bind(submission.studentId, submission.term).first<{ average: number | null }>();
+                const average = await env.DB.prepare("SELECT AVG(score) AS average FROM mark_submissions WHERE student_id = ? AND term = ? AND status = 'Approved'").bind(submission.studentId, submission.term).first<{ average: number }>();
                 await env.DB.prepare('UPDATE students SET average = ? WHERE id = ?').bind(average?.average || 0, submission.studentId).run();
             } else await env.DB.prepare("UPDATE mark_submissions SET status = 'Returned', feedback = ?, reviewed_at = datetime('now') WHERE id = ? AND status = 'Pending'").bind(body.feedback, path[1]).run();
             return json({ ok: true });
         }
         if (method === 'GET' && path[0] === 'attendance' && path.length === 1) {
-            const { results } = await env.DB.prepare('SELECT ar.id, ar.student_id AS studentId, s.name AS studentName, s.form, s.stream, ar.date, ar.status, ar.note FROM attendance_records ar JOIN students s ON s.id = ar.student_id ORDER BY ar.date DESC, s.name LIMIT 1000').all();
+            const { results } = await env.DB.prepare('SELECT ar.id, ar.student_id AS studentId, s.name AS studentName, s.form, s.stream, ar.date, ar.status, ar.note FROM attendance_records ar JOIN students s ON s.id = ar.student_id ORDER BY ar.date DESC').all();
             return json(results);
         }
         if (method === 'POST' && path[0] === 'attendance' && path.length === 1) {
             const body = await request.json() as { studentId?: unknown; date?: unknown; status?: unknown; note?: unknown };
-            if (!validText(body.studentId, 40) || typeof body.date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(body.date) || !['Present', 'Absent', 'Late', 'Excused'].includes(String(body.status)) || (typeof body.note !== 'string' || body.note.length > 300)) return badRequest('Attendance details are invalid.');
-            await env.DB.prepare('INSERT INTO attendance_records (student_id, date, status, note, recorded_by) VALUES (?, ?, ?, ?, ?) ON CONFLICT(student_id, date) DO UPDATE SET status = excluded.status, note = excluded.note, recorded_by = excluded.recorded_by').bind(body.studentId, body.date, body.status, body.note, email).run();
-            const attendance = await env.DB.prepare("SELECT 100.0 * SUM(CASE WHEN status IN ('Present', 'Late') THEN 1 ELSE 0 END) / NULLIF(SUM(CASE WHEN status != 'Excused' THEN 1 ELSE 0 END), 0) AS rate FROM attendance_records WHERE student_id = ?").bind(body.studentId).first<{ rate: number | null }>();
+            if (!validText(body.studentId, 40) || typeof body.date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(body.date) || !['Present', 'Absent', 'Late', 'Excused'].includes(String(body.status)) || (body.note && typeof body.note !== 'string') || (body.note && String(body.note).length > 200)) return badRequest('Check attendance details.');
+            await env.DB.prepare('INSERT INTO attendance_records (student_id, date, status, note, recorded_by) VALUES (?, ?, ?, ?, ?) ON CONFLICT(student_id, date) DO UPDATE SET status = excluded.status, note = excluded.note, recorded_by = excluded.recorded_by').bind(body.studentId, body.date, body.status, body.note || null, email).run();
+            const attendance = await env.DB.prepare("SELECT 100.0 * SUM(CASE WHEN status IN ('Present', 'Late') THEN 1 ELSE 0 END) / NULLIF(SUM(CASE WHEN status != 'Excused' THEN 1 ELSE 0 END), 0) AS rate FROM attendance_records WHERE student_id = ?").bind(body.studentId).first<{ rate: number }>();
             if (attendance?.rate !== null && attendance?.rate !== undefined) await env.DB.prepare('UPDATE students SET attendance = ? WHERE id = ?').bind(attendance.rate, body.studentId).run();
             return json({ ok: true });
         }
@@ -253,17 +333,17 @@ export async function onRequest({ request, env }: Context): Promise<Response> {
             return json({ ok: true }, 201);
         }
         if (path[0] === 'parent-messages' && path.length === 1 && method === 'GET') {
-            const { results } = await env.DB.prepare('SELECT pm.id, pm.parent_email AS parentEmail, pm.student_id AS studentId, s.name AS studentName, pm.subject, pm.message, pm.response, pm.status, pm.sender_role AS senderRole, pm.created_at AS createdAt FROM parent_messages pm LEFT JOIN students s ON s.id = pm.student_id ORDER BY pm.created_at DESC LIMIT 1000').all();
+            const { results } = await env.DB.prepare('SELECT pm.id, pm.parent_email AS parentEmail, pm.student_id AS studentId, s.name AS studentName, pm.subject, pm.message, pm.response, pm.status, pm.sender_role AS senderRole, pm.created_at AS createdAt, pm.responded_at AS respondedAt FROM parent_messages pm LEFT JOIN students s ON s.id = pm.student_id ORDER BY pm.created_at DESC').all();
             return json(results);
         }
         if (path[0] === 'parent-messages' && path.length === 1 && method === 'POST') {
             const body = await request.json() as { parentEmail?: unknown; studentId?: unknown; subject?: unknown; message?: unknown };
             const parentEmail = typeof body.parentEmail === 'string' ? body.parentEmail.trim().toLowerCase() : '';
-            if (!validText(parentEmail, 254) || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(parentEmail) || !validText(body.subject, 120) || !validText(body.message, 2000)) return badRequest('Choose a parent and enter a subject and message.');
+            if (!validText(parentEmail, 254) || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(parentEmail) || !validText(body.subject, 120) || !validText(body.message, 2000)) return badRequest('Choose a parent and enter subject and message.');
             const parent = await env.DB.prepare("SELECT email FROM accounts WHERE email = ? AND role = 'PARENT' AND active = 1").bind(parentEmail).first<{ email: string }>();
             if (!parent) return json({ error: 'Choose an active parent account.' }, 404);
             const studentId = typeof body.studentId === 'string' ? body.studentId : '';
-            if (studentId && !await env.DB.prepare('SELECT student_id FROM parent_students WHERE parent_email = ? AND student_id = ?').bind(parentEmail, studentId).first()) return badRequest('That student is not linked to the selected parent.');
+            if (studentId && !await env.DB.prepare('SELECT student_id FROM parent_students WHERE parent_email = ? AND student_id = ?').bind(parentEmail, studentId).first()) return badRequest('That student is not linked to this parent account.');
             await env.DB.prepare("INSERT INTO parent_messages (id, parent_email, student_id, subject, message, status, sender_role, responded_at) VALUES (?, ?, ?, 'School office: ' || ?, ?, 'Responded', 'SECRETARY', datetime('now'))").bind(crypto.randomUUID(), parentEmail, studentId || null, body.subject.trim(), body.message.trim()).run();
             return json({ ok: true }, 201);
         }
@@ -282,13 +362,13 @@ export async function onRequest({ request, env }: Context): Promise<Response> {
         }
         if (method === 'POST' && path[0] === 'settings' && path.length === 1) {
             const body = await request.json() as { secretaryPhone?: unknown; paymentDetails?: unknown; mapUrl?: unknown };
-            if (typeof body.secretaryPhone !== 'string' || body.secretaryPhone.length > 40 || !body.paymentDetails || typeof body.paymentDetails !== 'object' || typeof body.mapUrl !== 'string' || body.mapUrl.length > 1000) return badRequest('School settings are incomplete or invalid.');
+            if (typeof body.secretaryPhone !== 'string' || body.secretaryPhone.length > 40 || !body.paymentDetails || typeof body.paymentDetails !== 'object' || typeof body.mapUrl !== 'string' || body.mapUrl.length > 500) return badRequest('Check settings fields.');
             if (body.mapUrl.trim()) {
                 try { if (new URL(body.mapUrl).protocol !== 'https:') return badRequest('The school map link must use HTTPS.'); }
                 catch { return badRequest('Enter a valid HTTPS school map link.'); }
             }
             const details = body.paymentDetails as Record<string, unknown>;
-            if (['provider', 'accountName', 'accountNumber', 'instructions'].some((key) => typeof details[key] !== 'string' || String(details[key]).length > 160)) return badRequest('Payment account details are invalid.');
+            if (['provider', 'accountName', 'accountNumber', 'instructions'].some((key) => typeof details[key] !== 'string' || String(details[key]).length > 160)) return badRequest('Payment account details must be present and under 160 characters each.');
             await env.DB.batch([
                 env.DB.prepare('INSERT INTO school_settings (key, value, updated_at) VALUES (?, ?, datetime(\'now\')) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at').bind('secretary_phone', body.secretaryPhone),
                 env.DB.prepare('INSERT INTO school_settings (key, value, updated_at) VALUES (?, ?, datetime(\'now\')) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at').bind('payment_details', JSON.stringify(details)),
@@ -310,7 +390,7 @@ export async function onRequest({ request, env }: Context): Promise<Response> {
         }
         if (method === 'GET' && path[0] === 'finance' && path.length === 1) {
             const [paymentRows, feeRows] = await Promise.all([
-                env.DB.prepare('SELECT id, student, reference, date, amount, method FROM payments ORDER BY date DESC, created_at DESC').all(),
+                env.DB.prepare('SELECT id, student_id AS studentId, student, reference, date, amount, method FROM payments ORDER BY date DESC, created_at DESC').all(),
                 env.DB.prepare('SELECT label, amount FROM fee_items ORDER BY id').all(),
             ]);
             return json({ payments: paymentRows.results, fees: feeRows.results });
@@ -321,14 +401,14 @@ export async function onRequest({ request, env }: Context): Promise<Response> {
         }
         if (method === 'POST' && path[0] === 'students' && path.length === 1) {
             const body = await request.json() as Record<string, unknown>;
-            if (!validText(body.id, 40) || !validText(body.name) || !validForm(body.form) || !validText(body.guardian) || typeof body.balance !== 'number' || body.balance < 0 || typeof body.stream !== 'string' || body.stream.length > 80) return badRequest('Student details are incomplete or invalid.');
-            await env.DB.prepare('INSERT INTO students (id, name, form, stream, guardian, email, balance, average, attendance, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').bind(body.id, body.name, body.form, body.stream, body.guardian, typeof body.email === 'string' ? body.email : '', Math.round(body.balance), Number(body.average) || 0, Number(body.attendance) || 0, typeof body.status === 'string' ? body.status : 'Active').run();
+            if (!validText(body.id as string, 40) || !validText(body.name as string) || !validForm(body.form as string) || !validText(body.guardian as string) || typeof body.balance !== 'number' || body.balance < 0 || typeof body.stream !== 'string' || body.stream.length > 80) return badRequest('Student details are incomplete or invalid.');
+            await env.DB.prepare('INSERT INTO students (id, name, form, stream, guardian, email, balance, average, attendance, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').bind(body.id, body.name, body.form, body.stream, body.guardian, body.email || null, body.balance, 0, 0, 'Active').run();
             return json({ ok: true }, 201);
         }
         if (method === 'POST' && path[0] === 'admissions' && path.length === 1) {
             const body = await request.json() as Record<string, unknown>;
-            if (!validText(body.id, 40) || !validText(body.name) || !validForm(body.requestedForm) || !validText(body.guardian)) return badRequest('Application details are incomplete or invalid.');
-            await env.DB.prepare('INSERT INTO admissions (id, name, requested_form, guardian, date, status) VALUES (?, ?, ?, ?, ?, ?)').bind(body.id, body.name, body.requestedForm, body.guardian, typeof body.date === 'string' ? body.date : new Date().toISOString().slice(0, 10), 'Pending').run();
+            if (!validText(body.id as string, 40) || !validText(body.name as string) || !validForm(body.requestedForm as string) || !validText(body.guardian as string)) return badRequest('Application details are incomplete or invalid.');
+            await env.DB.prepare('INSERT INTO admissions (id, name, requested_form, guardian, date, status) VALUES (?, ?, ?, ?, ?, ?)').bind(body.id, body.name, body.requestedForm, body.guardian, new Date().toISOString().slice(0, 10), 'Pending').run();
             return json({ ok: true }, 201);
         }
         if (method === 'PATCH' && path[0] === 'admissions' && path.length === 2) {
@@ -345,17 +425,17 @@ export async function onRequest({ request, env }: Context): Promise<Response> {
         }
         if (method === 'POST' && path[0] === 'payments' && path.length === 1) {
             const body = await request.json() as Record<string, unknown>;
-            if (!validText(body.id, 40) || !validText(body.studentId, 40) || typeof body.amount !== 'number' || !Number.isSafeInteger(body.amount) || body.amount <= 0 || !validText(body.method, 40)) return badRequest('Payment details are incomplete or invalid.');
+            if (!validText(body.id as string, 40) || !validText(body.studentId as string, 40) || typeof body.amount !== 'number' || !Number.isSafeInteger(body.amount) || body.amount <= 0 || !validText(body.method as string, 40)) return badRequest('Payment details are incomplete or invalid.');
             const student = await env.DB.prepare('SELECT name FROM students WHERE id = ?').bind(body.studentId).first<{ name: string }>();
             if (!student) return json({ error: 'Student not found.' }, 404);
-            const statement = env.DB.prepare('INSERT INTO payments (id, student_id, student, reference, date, amount, method) VALUES (?, ?, ?, ?, ?, ?, ?)').bind(body.id, body.studentId, student.name, typeof body.reference === 'string' ? body.reference : '', typeof body.date === 'string' ? body.date : new Date().toISOString().slice(0, 10), body.amount, body.method);
+            const statement = env.DB.prepare('INSERT INTO payments (id, student_id, student, reference, date, amount, method) VALUES (?, ?, ?, ?, ?, ?, ?)').bind(body.id, body.studentId, student.name, body.reference || null, new Date().toISOString().slice(0, 10), body.amount, body.method);
             const update = env.DB.prepare('UPDATE students SET balance = MAX(0, balance - ?) WHERE id = ?').bind(body.amount, body.studentId);
             await env.DB.batch([statement, update]);
             return json({ ok: true }, 201);
         }
         if (method === 'POST' && path[0] === 'fees' && path.length === 1) {
             const body = await request.json() as { label?: unknown; amount?: unknown };
-            if (!validText(body.label, 100) || typeof body.amount !== 'number' || !Number.isSafeInteger(body.amount) || body.amount < 0) return badRequest('Fee item is incomplete or invalid.');
+            if (!validText(body.label as string, 100) || typeof body.amount !== 'number' || !Number.isSafeInteger(body.amount) || body.amount < 0) return badRequest('Fee item is incomplete or invalid.');
             await env.DB.prepare('INSERT INTO fee_items (label, amount) VALUES (?, ?)').bind(body.label, body.amount).run();
             return json({ ok: true }, 201);
         }
@@ -364,7 +444,7 @@ export async function onRequest({ request, env }: Context): Promise<Response> {
         }
         if (method === 'POST' && path[0] === 'report-shares' && path.length === 1) {
             const body = await request.json() as { studentId?: unknown; term?: unknown };
-            if (!validText(body.studentId, 40) || !validText(body.term, 40)) return badRequest('A student and report term are required.');
+            if (!validText(body.studentId as string, 40) || !validText(body.term as string, 40)) return badRequest('A student and report term are required.');
             const student = await env.DB.prepare('SELECT id FROM students WHERE id = ?').bind(body.studentId).first<{ id: string }>();
             if (!student) return json({ error: 'Student not found.' }, 404);
             const markCount = await env.DB.prepare("SELECT COUNT(*) AS total FROM marks m JOIN mark_submissions ms ON ms.student_id = m.student_id AND ms.term = m.term AND ms.subject = m.subject WHERE m.student_id = ? AND m.term = ? AND ms.status = 'Approved'").bind(body.studentId, body.term).first<{ total: number }>();
